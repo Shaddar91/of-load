@@ -1,0 +1,12 @@
+# Local run of the stress API, capped at 2 CPUs and 1 GiB.
+services:
+  load:
+    build: .
+    environment:
+      OF_API_URL: ${OF_API_URL:-http://api:8000}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:5173}
+    ports:
+      - "127.0.0.1:${OF_LOAD_PORT:-8001}:8000"
+    cpus: 2
+    mem_limit: 1g
+    pids_limit: 128
