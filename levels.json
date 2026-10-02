@@ -1,0 +1,7 @@
+{
+  "levels": [
+    {"name": "easy", "concurrency": 1, "duration_seconds": 30, "cpu_ms": 200, "mem_mib": 32},
+    {"name": "medium", "concurrency": 2, "duration_seconds": 30, "cpu_ms": 400, "mem_mib": 64},
+    {"name": "high", "concurrency": 4, "duration_seconds": 30, "cpu_ms": 800, "mem_mib": 128}
+  ]
+}
