@@ -1,0 +1,58 @@
+name: release-please
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  #opens or refreshes the release pull request from the conventional commits since the last tag; merging it tags and releases
+  release-please:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4.4.1
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  #the release commit's image, already built and tested by ci, gets the version tag; nothing is rebuilt
+  image:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - env:
+          REPO: ${{ secrets.ECR_REPOSITORY }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          #ci publishes $REPO:$GITHUB_SHA on the same push; wait for it, up to 30 minutes
+          for i in $(seq 1 60); do
+            docker manifest inspect "$REPO:$GITHUB_SHA" > /dev/null 2>&1 && break
+            [ "$i" -eq 60 ] && { echo "::error::$REPO:$GITHUB_SHA never appeared: ci did not publish this commit; re-run this workflow once it has"; exit 1; }
+            sleep 30
+          done
+          if docker manifest inspect "$REPO:$TAG" > /dev/null 2>&1; then
+            echo "$REPO:$TAG exists and the repository is immutable: tag skipped"
+          else
+            docker buildx imagetools create -t "$REPO:$TAG" "$REPO:$GITHUB_SHA"
+          fi
+          echo "Released **$TAG** as $REPO:$TAG (digest of $GITHUB_SHA)" >> "$GITHUB_STEP_SUMMARY"
