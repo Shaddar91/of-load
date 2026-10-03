@@ -163,4 +163,3 @@ Thumbs.db
 #------------------------------------------------------------------------------
 #all markdown uncommitted — negate per-repo with !README.md if truly needed
 *.md
-!README.md
