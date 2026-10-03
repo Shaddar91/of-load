@@ -1,7 +1,8 @@
 //Service settings read from the environment.
 
 use std::env;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use axum::http::HeaderValue;
@@ -43,8 +44,19 @@ impl Config {
 fn text(name: &str) -> Option<String> {
     env::var(name)
         .ok()
+        .or_else(|| secret_file(name))
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
+}
+
+//SECRETS_DIR holds one file per setting, named like the variable: the mounted Secrets Manager secret.
+fn secret_file(name: &str) -> Option<String> {
+    let dir = env::var("SECRETS_DIR").ok().filter(|dir| !dir.is_empty())?;
+    secret_file_in(Path::new(&dir), name)
+}
+
+fn secret_file_in(dir: &Path, name: &str) -> Option<String> {
+    fs::read_to_string(dir.join(name)).ok()
 }
 
 fn number<T: FromStr>(name: &str, default: T) -> Result<T, String> {
@@ -65,4 +77,22 @@ fn origins(raw: &str) -> Result<Vec<HeaderValue>, String> {
                 .map_err(|_| format!("CORS_ALLOWED_ORIGINS: {origin} is not a valid origin"))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_file_in_reads_the_file_named_like_the_setting() {
+        let dir = env::temp_dir().join(format!("of-load-secrets-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("OF_API_URL"), "http://api.test\n").unwrap();
+        assert_eq!(
+            secret_file_in(&dir, "OF_API_URL").as_deref(),
+            Some("http://api.test\n")
+        );
+        assert_eq!(secret_file_in(&dir, "MISSING"), None);
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

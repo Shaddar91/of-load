@@ -46,6 +46,7 @@ CORS allows the origins in `CORS_ALLOWED_ORIGINS`, the methods GET, POST and OPT
 | `OF_API_URL` | `http://api:8000` | of-api base URL for the token check; HTTP only, the binary has no TLS |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:5173` | comma-separated browser origins |
 | `STRESS_LEVELS_FILE` | unset: the `levels.json` built into the binary | path to a levels file of the same shape |
+| `SECRETS_DIR` | unset | directory with one file per setting, named like the variable; a file backs a variable that is unset, how the chart hands over the mounted Secrets Manager secret |
 | `STRESS_MAX_INFLIGHT` | `4` | burns one process runs at once; past that it answers 429 |
 | `STRESS_MAX_CPU_MS` | `2000` | ceiling for any level's `cpu_ms` |
 | `STRESS_MAX_MEM_MIB` | `256` | ceiling for any level's `mem_mib` |
@@ -115,14 +116,7 @@ The Dockerfile compiles a static musl binary on `rust:1.96-alpine` and copies it
 
 ## How it ships
 
-Terraform outside this repo owns the cloud side: an ECR stack, an app-service stack and the frontend stack. Nothing here applies it.
-
-1. Push this repo's `master` before the ECR stack's first apply. That apply commits `.github/workflows/ci.yml` here, and the commit starts a CI run; on a repo without the code that run fails, and it needs a re-run after the push.
-2. The ECR stack creates the `of-load` ECR repository, the CI role GitHub Actions assumes over OIDC from `master`, the Actions secrets `AWS_ROLE_ARN`, `AWS_REGION` and `ECR_REPOSITORY`, and the workflow. Edit the workflow in that stack; its next apply overwrites a change made here.
-3. Every push and pull request to `master` runs the checks and builds both images. Only `master` pushes them.
-4. Before the app-service stack's first apply, set the three values in its `helm/values.yaml` that ship as `CHANGEME`: `image.repository` (the ECR repository URL), `image.tag` (a `<sha>` CI pushed) and `cors.allowedOrigins` (the origin the deployed of-web is served from). Left as `CHANGEME`, the pods cannot pull their image and the browser's calls fail CORS.
-5. The app-service stack creates the target group, a host rule for `load.<zone>` on the HTTPS listener, a certificate and a DNS record for that name, and the Argo CD Application. On apply it commits the chart to the of-helm repo under `charts/of-load`, and Argo CD deploys it to namespace `of-load` on arm64 nodes. The Argo CD project has to allow namespace `of-load`, or it refuses the Application.
-6. The frontend stack passes `https://load.<zone>` to of-web's build as `VITE_LOAD_API_BASE_URL`.
+The CI workflow is generated outside this repository, so an edit made to it here is overwritten. Every push and pull request to `master` runs the three checks and builds both images; only a push to `master` publishes them. The chart that runs the image in the cluster ships `image.repository` and `image.tag` as `CHANGEME`; left so, the pods cannot pull their image. `OF_API_URL` and `CORS_ALLOWED_ORIGINS` come from the Secrets Manager secret the stack writes, mounted as files under `/mnt/secrets` and read through `SECRETS_DIR`.
 
 ## Scaling test in the cluster
 
