@@ -1,0 +1,168 @@
+#Managed by Terraform; edits made here are overwritten on its next apply.
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+env:
+  PUBLISH: ${{ github.ref == 'refs/heads/master' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      #rustup on the runner installs the toolchain rust-toolchain.toml pins on the first cargo call
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  build:
+    needs: test
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      #no attestations: each <sha>-<arch> tag must point at the image manifest itself, never at an index
+      - run: docker build --platform linux/${{ matrix.arch }} --provenance=false --sbom=false -t of-load:ci .
+      - run: |
+          docker run -d -p 8000:8000 --name of-load of-load:ci
+          curl -fsS --retry 10 --retry-all-errors --retry-delay 1 localhost:8000/healthz || { docker logs of-load; exit 1; }
+      - if: env.PUBLISH == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      - if: env.PUBLISH == 'true'
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+      - if: env.PUBLISH == 'true'
+        env:
+          IMAGE: ${{ secrets.ECR_REPOSITORY }}:${{ github.sha }}-${{ matrix.arch }}
+        run: |
+          if docker manifest inspect "$IMAGE" > /dev/null 2>&1; then
+            echo "$IMAGE exists and the repository is immutable: push skipped"
+          else
+            docker tag of-load:ci "$IMAGE"
+            docker push "$IMAGE"
+          fi
+
+  manifest:
+    needs: build
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - env:
+          REPO: ${{ secrets.ECR_REPOSITORY }}
+        run: |
+          if docker manifest inspect "$REPO:$GITHUB_SHA" > /dev/null 2>&1; then
+            echo "$REPO:$GITHUB_SHA exists and the repository is immutable: index skipped"
+          else
+            docker buildx imagetools create -t "$REPO:$GITHUB_SHA" "$REPO:$GITHUB_SHA-amd64" "$REPO:$GITHUB_SHA-arm64"
+          fi
+
+  codeql:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          languages: rust
+          build-mode: none
+          queries: security-extended
+      - uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+
+  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+
+  audit:
+    #snyk test has no Cargo support, so the RustSec advisory database covers the dependencies
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - env:
+          CARGO_AUDIT_SHA256: 7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428
+        run: |
+          curl -fsSLo "$RUNNER_TEMP/cargo-audit.tgz" https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.22.2/cargo-audit-x86_64-unknown-linux-musl-v0.22.2.tgz
+          echo "$CARGO_AUDIT_SHA256  $RUNNER_TEMP/cargo-audit.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/cargo-audit.tgz" -C "$RUNNER_TEMP" --strip-components=1 cargo-audit-x86_64-unknown-linux-musl-v0.22.2/cargo-audit
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: Vulnerable dependencies, RustSec advisories
+        run: cargo audit
+
+  snyk:
+    #fork PRs get no secrets; codeql, dependency-review and audit still cover them
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Code issues, high
+        run: npx --yes snyk@1.1307.4 code test --severity-threshold=high
+
+  zizmor:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
